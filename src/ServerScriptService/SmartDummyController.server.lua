@@ -16,6 +16,8 @@ type MemoryEntry = LocalBrain.MemoryEntry
 type Session = {
 	memory: { MemoryEntry },
 	lastMessageAt: number,
+	lastNormalized: string,
+	repeatCount: number,
 	messageCount: number,
 	commandCount: number,
 	lastIntent: string,
@@ -31,6 +33,14 @@ local sessions = {} :: { [number]: Session }
 local brain = LocalBrain.new()
 local dummy = DummyController.new()
 local startedAt = os.clock()
+
+local STATUS_TRIGGERS = {
+	"status",
+	"stats",
+	"session",
+	"what did i say",
+	"what are you doing",
+} :: { string }
 
 -- quick help only. normal chat still goes through LocalBrain so the dummy is
 -- not just a command menu with legs.
@@ -64,12 +74,28 @@ local function sessionFor(player: Player): Session
 	session = {
 		memory = {},
 		lastMessageAt = 0,
+		lastNormalized = "",
+		repeatCount = 0,
 		messageCount = 0,
 		commandCount = 0,
 		lastIntent = "none",
 	}
 	sessions[player.UserId] = session
 	return session
+end
+
+-- repeats are tracked because spam should not run the full brain path every
+-- time. same message three times gets stopped early and keeps the server chill.
+local function updateRepeatState(session: Session, message: string): boolean
+	local normalized = string.lower(message)
+	if normalized == session.lastNormalized then
+		session.repeatCount += 1
+	else
+		session.lastNormalized = normalized
+		session.repeatCount = 1
+	end
+
+	return session.repeatCount >= 3
 end
 
 -- memory is capped because the dummy only needs recent context. keeping every
@@ -112,6 +138,50 @@ local function findGuide(message: string): GuideEntry?
 		end
 	end
 	return nil
+end
+
+-- status is a tiny useful command for showing the system is actually tracking
+-- session state, not just throwing random chat bubbles.
+local function isStatusRequest(message: string): boolean
+	local lower = string.lower(message)
+	for _, trigger in STATUS_TRIGGERS do
+		if lower == trigger then
+			return true
+		end
+	end
+	return false
+end
+
+local function formatDistance(distance: number?): string
+	if not distance then
+		return "unknown"
+	end
+	return tostring(math.floor(distance + 0.5)) .. " studs"
+end
+
+local function summarizeRecentTopic(session: Session): string
+	for index = #session.memory, 1, -1 do
+		local entry = session.memory[index]
+		if entry.role == "user" then
+			local topic = TextUtil.topic(TextUtil.words(entry.text))
+			if topic then
+				return topic
+			end
+		end
+	end
+	return "nothing yet"
+end
+
+local function sendStatus(player: Player, session: Session)
+	local distance = formatDistance(dummy:distanceTo(player))
+	local topic = summarizeRecentTopic(session)
+	local uptime = tostring(math.floor(os.clock() - startedAt))
+	dummy:say(player, "status: " .. tostring(session.messageCount) .. " msgs, " .. tostring(session.commandCount) .. " cmds, last intent " .. session.lastIntent)
+	task.delay(0.55, function()
+		if player.Parent then
+			dummy:say(player, "distance " .. distance .. ", topic " .. topic .. ", awake " .. uptime .. "s")
+		end
+	end)
 end
 
 -- only exact guide requests get swallowed. if someone says "explain scripting"
@@ -213,6 +283,15 @@ local function handleGuideIfNeeded(player: Player, message: string): boolean
 	return false
 end
 
+local function handleStatusIfNeeded(player: Player, session: Session, message: string): boolean
+	if not isStatusRequest(message) then
+		return false
+	end
+
+	sendStatus(player, session)
+	return true
+end
+
 -- full flow is here: clean input, check session rules, remember text, analyze,
 -- reply, then execute the command. brain and movement are split so this stays
 -- readable instead of becoming one giant messy file.
@@ -224,6 +303,15 @@ local function handleMessage(player: Player, rawMessage: string)
 
 	local session = sessionFor(player)
 	if not playerIsAllowed(player, session) then
+		return
+	end
+
+	if updateRepeatState(session, message) then
+		dummy:say(player, "you already said that bro, give me a new command")
+		return
+	end
+
+	if handleStatusIfNeeded(player, session, message) then
 		return
 	end
 
