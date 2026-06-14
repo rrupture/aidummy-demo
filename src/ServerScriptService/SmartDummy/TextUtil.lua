@@ -173,13 +173,27 @@ function TextUtil.direction(list: { string }): string?
 	return nil
 end
 
--- Phrase rules run before word rules
--- this matters because "stop following" must resolve as stop, not follow
+-- Phrase rules run before word rules, but phrase priority also matters
+-- longest matching phrase wins, so "stop following" beats the shorter "follow"
+-- this fixes command overlap without relying on fragile command order
 function TextUtil.inferIntent(lower: string, list: { string }, intents: { Intent }): string
+	local bestIntent = nil :: string?
+	local bestLength = 0
+
 	for _, intent in intents do
-		if TextUtil.hasPhrase(lower, intent.phrases) then
-			return intent.name
+		for _, phrase in intent.phrases do
+			if string.find(lower, phrase, 1, true) and #phrase > bestLength then
+				bestIntent = intent.name
+				bestLength = #phrase
+			end
 		end
+	end
+
+	if bestIntent then
+		return bestIntent
+	end
+
+	for _, intent in intents do
 		if intent.words then
 			for _, word in intent.words do
 				if TextUtil.hasWord(list, word) then

@@ -1,3 +1,4 @@
+-- Connected Discord-GitHub
 --!strict
 
 local Chat = game:GetService("Chat")
