@@ -8,51 +8,30 @@ export type Intent = {
 
 local TextUtil = {}
 
--- words like "the" and "you" do not tell us the topic. removing them makes
--- the local brain pick useful words instead of random filler.
-local STOP_WORDS = table.freeze({
-	a = true,
-	about = true,
-	am = true,
-	an = true,
-	["and"] = true,
-	are = true,
-	at = true,
-	be = true,
-	bro = true,
-	bruh = true,
-	can = true,
-	["do"] = true,
-	["for"] = true,
-	from = true,
-	how = true,
-	i = true,
-	["in"] = true,
-	is = true,
-	it = true,
-	me = true,
-	my = true,
-	of = true,
-	on = true,
-	["or"] = true,
-	so = true,
-	that = true,
-	the = true,
-	this = true,
-	to = true,
-	u = true,
-	what = true,
-	when = true,
-	where = true,
-	who = true,
-	why = true,
-	with = true,
-	you = true,
-	your = true,
+local function makeSet(values: { string }): { [string]: boolean }
+	-- frozen sets make membership checks cheap and stop accidental runtime edits
+	local set = {}
+	for _, value in values do
+		set[value] = true
+	end
+	return table.freeze(set)
+end
+
+-- These dictionaries are intentionally small
+-- this is not pretending to be a real LLM
+-- they provide cheap local signals for intent, tone, and topic
+local STOP_WORDS = makeSet({
+	"a", "about", "am", "an", "and", "are", "at", "be", "bro", "bruh", "can", "do", "for",
+	"from", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "so", "that",
+	"the", "this", "to", "u", "what", "when", "where", "who", "why", "with", "you", "your",
 })
 
--- tiny sentiment tables. this is cheap, local, and good enough to change the
--- dummy tone without calling an api.
+local TECH_WORDS = makeSet({
+	"cframe", "code", "event", "humanoid", "lerp", "lua", "luau", "metatable", "metatables",
+	"module", "pathfinding", "physics", "raycast", "roblox", "server", "signal", "script",
+	"scripting", "state", "tween",
+})
+
 local POSITIVE_WORDS = table.freeze({
 	clean = 1,
 	cool = 2,
@@ -67,6 +46,7 @@ local POSITIVE_WORDS = table.freeze({
 })
 
 local NEGATIVE_WORDS = table.freeze({
+	annoying = -1,
 	ass = -2,
 	bad = -1,
 	broke = -2,
@@ -81,47 +61,27 @@ local NEGATIVE_WORDS = table.freeze({
 	wrong = -1,
 })
 
--- technical words make the dummy switch from normal chat into explanation mode.
--- this is how one brain can answer both "yo" and "explain cframe".
-local TECH_WORDS = table.freeze({
-	cframe = true,
-	code = true,
-	["function"] = true,
-	humanoid = true,
-	lua = true,
-	luau = true,
-	metatable = true,
-	metatables = true,
-	module = true,
-	pathfinding = true,
-	physics = true,
-	raycast = true,
-	roblox = true,
-	script = true,
-	scripting = true,
-	server = true,
-	studio = true,
-})
-
 function TextUtil.trim(text: string): string
+	-- Roblox chat can include leading/trailing spaces, strip them before gates run
 	text = string.gsub(text, "^%s+", "")
 	text = string.gsub(text, "%s+$", "")
 	return text
 end
 
--- turns any message into lowercase word tokens. every other helper uses this,
--- so parsing happens once in one simple format.
+-- All parsing starts with normalized word tokens
+-- the rest of the system avoids repeatedly searching raw strings,
+-- which keeps command behavior predictable
 function TextUtil.words(text: string): { string }
-	local words = {}
+	local list = {}
 	for word in string.gmatch(string.lower(text), "[%w_']+") do
-		table.insert(words, word)
+		table.insert(list, word)
 	end
-	return words
+	return list
 end
 
--- phrase checks run before single-word checks because "stop following" should
--- mean stop, not follow.
 function TextUtil.hasPhrase(lower: string, phrases: { string }): boolean
+	-- phrase checks use plain search, no pattern magic
+	-- player text should not accidentally become a Lua pattern
 	for _, phrase in phrases do
 		if string.find(lower, phrase, 1, true) then
 			return true
@@ -130,8 +90,8 @@ function TextUtil.hasPhrase(lower: string, phrases: { string }): boolean
 	return false
 end
 
-function TextUtil.hasWord(words: { string }, target: string): boolean
-	for _, word in words do
+function TextUtil.hasWord(list: { string }, target: string): boolean
+	for _, word in list do
 		if word == target then
 			return true
 		end
@@ -139,8 +99,8 @@ function TextUtil.hasWord(words: { string }, target: string): boolean
 	return false
 end
 
-function TextUtil.hasAny(words: { string }, dictionary: { [string]: any }): boolean
-	for _, word in words do
+function TextUtil.hasAny(list: { string }, dictionary: { [string]: any }): boolean
+	for _, word in list do
 		if dictionary[word] then
 			return true
 		end
@@ -148,8 +108,8 @@ function TextUtil.hasAny(words: { string }, dictionary: { [string]: any }): bool
 	return false
 end
 
-function TextUtil.firstNumber(words: { string }): number?
-	for _, word in words do
+function TextUtil.firstNumber(list: { string }): number?
+	for _, word in list do
 		local number = tonumber(word)
 		if number then
 			return number
@@ -158,71 +118,17 @@ function TextUtil.firstNumber(words: { string }): number?
 	return nil
 end
 
--- score is not trying to be deep ai. it only helps the reply feel less flat
--- when the player sounds hyped or annoyed.
-function TextUtil.sentiment(words: { string }): number
-	local score = 0
-	for _, word in words do
-		score += POSITIVE_WORDS[word] or 0
-		score += NEGATIVE_WORDS[word] or 0
+function TextUtil.clampNumber(value: number?, fallback: number, minValue: number, maxValue: number): number
+	-- every number from chat goes through one clamp helper
+	-- protects movement distance, jump count, orbit time, and speed
+	if typeof(value) ~= "number" or value ~= value then
+		value = fallback
 	end
-	return score
+	return math.clamp(value, minValue, maxValue)
 end
 
--- first non-filler long word becomes the topic. short memory can reuse it if
--- the next message says "yeah explain that".
-function TextUtil.topic(words: { string }): string?
-	for _, word in words do
-		if #word >= 4 and not STOP_WORDS[word] then
-			return word
-		end
-	end
-	return nil
-end
-
--- direction words are normalized here so movement code only has to handle four
--- clean directions.
-function TextUtil.direction(words: { string }): string?
-	if TextUtil.hasWord(words, "left") then
-		return "left"
-	elseif TextUtil.hasWord(words, "right") then
-		return "right"
-	elseif TextUtil.hasWord(words, "forward") or TextUtil.hasWord(words, "ahead") then
-		return "forward"
-	elseif TextUtil.hasWord(words, "back") or TextUtil.hasWord(words, "backward") or TextUtil.hasWord(words, "backwards") then
-		return "back"
-	end
-	return nil
-end
-
--- intent detection is data-driven. LocalBrain passes in intent rules, this just
--- runs the matching in a stable order.
-function TextUtil.inferIntent(lower: string, words: { string }, intents: { Intent }): string
-	for _, intent in intents do
-		if TextUtil.hasPhrase(lower, intent.phrases) then
-			return intent.name
-		end
-		if intent.words then
-			for _, word in intent.words do
-				if TextUtil.hasWord(words, word) then
-					return intent.name
-				end
-			end
-		end
-	end
-	return "chat"
-end
-
-function TextUtil.isQuestion(message: string, lower: string): boolean
-	return string.find(message, "?", 1, true) ~= nil or TextUtil.hasPhrase(lower, { "how ", "what ", "why ", "where ", "can you" })
-end
-
-function TextUtil.isTechnical(lower: string, words: { string }): boolean
-	return TextUtil.hasAny(words, TECH_WORDS) or TextUtil.hasPhrase(lower, { "explain ", "teach me", "how do i", "how does" })
-end
-
--- deterministic picker. same input gives same answer, so it feels stable, but
--- different messages still get different wording.
+-- Deterministic selection gives variety without random state
+-- the same message chooses the same reply, which feels stable and easier to debug
 function TextUtil.pick(options: { string }, seedText: string): string
 	local seed = 0
 	for index = 1, #seedText do
@@ -231,13 +137,71 @@ function TextUtil.pick(options: { string }, seedText: string): string
 	return options[(seed % #options) + 1]
 end
 
--- all numeric commands go through this clamp so nobody can ask for speed 9999
--- and break the humanoid.
-function TextUtil.clampNumber(value: number?, fallback: number, minValue: number, maxValue: number): number
-	if typeof(value) ~= "number" or value ~= value then
-		value = fallback
+function TextUtil.sentiment(list: { string }): number
+	-- simple tone score
+	-- it only decides reply style, never physical NPC behavior
+	local score = 0
+	for _, word in list do
+		score += POSITIVE_WORDS[word] or 0
+		score += NEGATIVE_WORDS[word] or 0
 	end
-	return math.clamp(value, minValue, maxValue)
+	return score
+end
+
+function TextUtil.topic(list: { string }): string?
+	-- first useful word becomes the topic
+	-- not perfect language understanding, but good enough for short chat context
+	for _, word in list do
+		if #word >= 4 and not STOP_WORDS[word] then
+			return word
+		end
+	end
+	return nil
+end
+
+function TextUtil.direction(list: { string }): string?
+	-- direction is separated from intent because several commands can use it
+	if TextUtil.hasWord(list, "left") then
+		return "left"
+	elseif TextUtil.hasWord(list, "right") then
+		return "right"
+	elseif TextUtil.hasWord(list, "forward") or TextUtil.hasWord(list, "ahead") then
+		return "forward"
+	elseif TextUtil.hasWord(list, "back") or TextUtil.hasWord(list, "backward") or TextUtil.hasWord(list, "backwards") then
+		return "back"
+	end
+	return nil
+end
+
+-- Phrase rules run before word rules
+-- this matters because "stop following" must resolve as stop, not follow
+function TextUtil.inferIntent(lower: string, list: { string }, intents: { Intent }): string
+	for _, intent in intents do
+		if TextUtil.hasPhrase(lower, intent.phrases) then
+			return intent.name
+		end
+		if intent.words then
+			for _, word in intent.words do
+				if TextUtil.hasWord(list, word) then
+					return intent.name
+				end
+			end
+		end
+	end
+	return "chat"
+end
+
+function TextUtil.isQuestion(raw: string, lower: string): boolean
+	-- question marks and common question starts both count
+	return string.find(raw, "?", 1, true) ~= nil
+		or TextUtil.hasPhrase(lower, { "how ", "what ", "why ", "where ", "can you", "do you" })
+end
+
+function TextUtil.isTechnical(lower: string, list: { string }): boolean
+	-- technical detection routes to explanation style replies
+	-- it does not change movement permissions or server gates
+	return TextUtil.hasAny(list, TECH_WORDS)
+		or TextUtil.hasPhrase(lower, { "explain ", "teach me", "how do i", "how does" })
 end
 
 function TextUtil.isTechnicalWord(word: string): boolean

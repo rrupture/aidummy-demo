@@ -1,358 +1,471 @@
--- Connected Discord-GitHub
 --!strict
+
+--[[
+	SmartDummyController
+
+	This script is the server entry point for the dummy. It does not contain the
+	entire NPC implementation because that would make the file harder to maintain.
+	Instead, it coordinates the modules under ServerScriptService/SmartDummy:
+
+	- Config controls tuning values.
+	- TextUtil handles low-level text parsing helpers.
+	- SessionStore owns per-player memory and spam tracking.
+	- Brain turns player chat into structured intent data and a reply.
+	- NpcController owns Roblox actions: Humanoid movement, pathfinding, raycasts,
+	  smooth CFrame facing, jumping, orbiting, and chat bubbles.
+
+	The important design rule is server authority. Players can type chat, but the
+	client never directly tells the NPC where to move. The server validates range,
+	cooldown, and line of sight before any expensive or physical action runs.
+
+	This is not a real LLM inside Roblox. It is a local procedural brain:
+	command metadata, text parsing, recent memory, and Roblox action execution.
+	The point is to make the dummy feel responsive without HTTP, hidden backend
+	state, or unsafe client control.
+]]
+
 local Players = game:GetService("Players")
 
-local SmartDummy = script.Parent:WaitForChild("SmartDummy")
-local Config = require(SmartDummy.Config)
-local DummyController = require(SmartDummy.DummyController)
-local LocalBrain = require(SmartDummy.LocalBrain)
-local TextUtil = require(SmartDummy.TextUtil)
-
--- this script is the traffic control. it does not try to move the npc itself
--- and it does not try to be the whole brain. it checks chat, saves tiny memory,
--- asks LocalBrain what the player meant, then tells DummyController to do it.
-type MemoryEntry = LocalBrain.MemoryEntry
+local Modules = script.Parent:WaitForChild("SmartDummy")
+local Brain = require(Modules.Brain)
+local CommandRegistry = require(Modules.CommandRegistry)
+local Config = require(Modules.Config)
+local NpcController = require(Modules.NpcController)
+local SessionStore = require(Modules.SessionStore)
+local TextUtil = require(Modules.TextUtil)
 
 type Session = {
-	memory: { MemoryEntry },
+	memory: { any },
 	lastMessageAt: number,
 	lastNormalized: string,
 	repeatCount: number,
 	messageCount: number,
 	commandCount: number,
 	lastIntent: string,
+	lastTopic: string?,
 }
 
-type GuideEntry = {
-	id: string,
-	triggers: { string },
-	lines: { string },
+type GateResult = {
+	ok: boolean,
+	reason: string?,
+	distance: number?,
 }
 
-local sessions = {} :: { [number]: Session }
-local brain = LocalBrain.new()
-local dummy = DummyController.new()
-local startedAt = os.clock()
+type SpecialRequest = "none" | "help" | "status" | "memory" | "demo" | "about" | "internals"
 
-local STATUS_TRIGGERS = {
-	"status",
-	"stats",
-	"session",
-	"what did i say",
-	"what are you doing",
-} :: { string }
+local HELP_DELAY = 0.55
+local GREETING_DELAY = 1.2
+local FAR_VISIBILITY_DISTANCE = 28
 
--- quick help only. normal chat still goes through LocalBrain so the dummy is
--- not just a command menu with legs.
-local GUIDE = {
-	{
-		id = "movement",
-		triggers = { "help", "commands", "what can you do", "movement" },
-		lines = {
-			"i can follow, stop, come here, go there, move left or right, jump, sit, stand, spin, orbit, and change speed",
-			"try: follow me | stop following | go there | move left 12 | triple jump | speed 24",
-		},
-	},
-	{
-		id = "technical",
-		triggers = { "technical", "explain", "coding", "script" },
-		lines = {
-			"ask scripting questions too. i break the message into topic, tone, and intent before answering",
-			"try: explain pathfinding | explain cframe | how do metatables work",
-		},
-	},
-} :: { GuideEntry }
+local STATUS_PREFIX = "status:"
+local MEMORY_PREFIX = "memory:"
 
--- each player gets separate short memory. without this, one player could talk
--- about pathfinding and another player would accidentally inherit that topic.
-local function sessionFor(player: Player): Session
-	local session = sessions[player.UserId]
-	if session then
-		return session
-	end
+local sessions = SessionStore.new()
+local dummy = NpcController.new()
 
-	session = {
-		memory = {},
-		lastMessageAt = 0,
-		lastNormalized = "",
-		repeatCount = 0,
-		messageCount = 0,
-		commandCount = 0,
-		lastIntent = "none",
-	}
-	sessions[player.UserId] = session
-	return session
+local brain = Brain.new(function(session)
+	return sessions:RecentTopic(session)
+end)
+
+local function now(): number
+	-- os.clock is monotonic enough for cooldowns and timed focus windows
+	return os.clock()
 end
 
--- repeats are tracked because spam should not run the full brain path every
--- time. same message three times gets stopped early and keeps the server chill.
-local function updateRepeatState(session: Session, message: string): boolean
-	local normalized = string.lower(message)
-	if normalized == session.lastNormalized then
-		session.repeatCount += 1
-	else
-		session.lastNormalized = normalized
-		session.repeatCount = 1
-	end
-
-	return session.repeatCount >= 3
+local function playerStillValid(player: Player): boolean
+	-- delayed replies can fire after a player leaves, so every delayed path checks this
+	return player.Parent == Players
 end
 
--- memory is capped because the dummy only needs recent context. keeping every
--- message forever would be wasted table growth for no real gain.
-local function pushMemory(session: Session, role: "user" | "dummy", text: string)
-	table.insert(session.memory, {
-		role = role,
-		text = text,
-	})
-
-	while #session.memory > Config.MemoryLimit do
-		table.remove(session.memory, 1)
-	end
+local function lower(text: string): string
+	return string.lower(text)
 end
 
--- clean the message before the brain sees it. slash commands are ignored so
--- Roblox chat commands do not turn into npc commands by accident.
-local function normalizeMessage(message: string): string?
-	message = TextUtil.trim(message)
-	if message == "" or string.sub(message, 1, 1) == "/" then
+local function startsWith(text: string, prefix: string): boolean
+	return string.sub(text, 1, #prefix) == prefix
+end
+
+local function isSlashCommand(message: string): boolean
+	return startsWith(message, "/")
+end
+
+local function trimToChatLimit(message: string): string
+	-- protect chat bubbles and memory from massive pasted messages
+	if #message <= Config.MaxMessageLength then
+		return message
+	end
+
+	return string.sub(message, 1, Config.MaxMessageLength)
+end
+
+-- Normalization is done before every other check. Empty messages and Roblox slash
+-- commands should not wake the dummy or modify session state.
+local function normalizeMessage(rawMessage: string): string?
+	local message = TextUtil.trim(rawMessage)
+	if message == "" or isSlashCommand(message) then
+		-- slash commands belong to Roblox chat, not the dummy brain
 		return nil
 	end
 
-	if #message > Config.MaxMessageLength then
-		message = string.sub(message, 1, Config.MaxMessageLength)
-	end
-
-	return message
+	return trimToChatLimit(message)
 end
 
--- guide matching is separate from brain analysis because help text should be
--- instant, but real questions should still get a real generated reply.
-local function findGuide(message: string): GuideEntry?
-	local lower = string.lower(message)
-	for _, guide in GUIDE do
-		for _, trigger in guide.triggers do
-			if string.find(lower, trigger, 1, true) then
-				return guide
-			end
-		end
+local function classifySpecialRequest(message: string): SpecialRequest
+	-- utility requests skip the normal brain because they are exact system queries
+	-- help/status/memory should never accidentally become movement commands
+	local utility = CommandRegistry.MatchUtility(lower(message))
+	if utility == "help" then
+		return "help"
+	elseif utility == "status" then
+		return "status"
+	elseif utility == "memory" then
+		return "memory"
+	elseif utility == "demo" then
+		return "demo"
+	elseif utility == "architecture" then
+		return "about"
+	elseif utility == "internals" then
+		return "internals"
 	end
-	return nil
-end
 
--- status is a tiny useful command for showing the system is actually tracking
--- session state, not just throwing random chat bubbles.
-local function isStatusRequest(message: string): boolean
-	local lower = string.lower(message)
-	for _, trigger in STATUS_TRIGGERS do
-		if lower == trigger then
-			return true
-		end
-	end
-	return false
+	return "none"
 end
 
 local function formatDistance(distance: number?): string
+	-- keep player-facing status readable, no decimals needed for studs here
 	if not distance then
 		return "unknown"
 	end
+
 	return tostring(math.floor(distance + 0.5)) .. " studs"
 end
 
-local function summarizeRecentTopic(session: Session): string
-	for index = #session.memory, 1, -1 do
-		local entry = session.memory[index]
-		if entry.role == "user" then
-			local topic = TextUtil.topic(TextUtil.words(entry.text))
-			if topic then
-				return topic
-			end
-		end
+local function formatTopic(topic: string?): string
+	return topic or "none"
+end
+
+local function formatIntent(intent: string): string
+	if intent == "" then
+		return "chat"
 	end
-	return "nothing yet"
+
+	return intent
+end
+
+local function formatCount(value: number, singular: string, plural: string): string
+	if value == 1 then
+		return "1 " .. singular
+	end
+
+	return tostring(value) .. " " .. plural
+end
+
+local function responseDelay(message: string): number
+	-- tiny fake thinking delay based on message length
+	-- clamped so replies feel paced but never slow
+	return math.clamp(#message * 0.009, Config.ThinkingSecondsMin, Config.ThinkingSecondsMax)
+end
+
+-- Sending several chat bubbles in sequence is wrapped in one helper
+-- every multi-line response gets player removal checks and consistent timing
+local function sendLines(player: Player, lines: { string }, delaySeconds: number?)
+	task.spawn(function()
+		for _, line in lines do
+			if not playerStillValid(player) then
+				return
+			end
+
+			dummy:Say(player, line)
+			task.wait(delaySeconds or HELP_DELAY)
+		end
+	end)
+end
+
+local function sendHelp(player: Player)
+	sendLines(player, CommandRegistry.BuildHelpLines(), HELP_DELAY)
+end
+
+local function sendDemo(player: Player)
+	sendLines(player, CommandRegistry.BuildDemoLines(), HELP_DELAY)
+end
+
+local function sendAbout(player: Player)
+	sendLines(player, CommandRegistry.BuildArchitectureLines(), HELP_DELAY)
+end
+
+local function sendInternals(player: Player)
+	sendLines(player, CommandRegistry.BuildInternalsLines(), HELP_DELAY)
+end
+
+local function buildStatusLines(player: Player, session: Session): { string }
+	-- status is generated from live session + NPC distance
+	-- useful for showing memory and command counters are actual runtime state
+	local distance = dummy:DistanceTo(player)
+	local messageCount = formatCount(session.messageCount, "message", "messages")
+	local commandCount = formatCount(session.commandCount, "command", "commands")
+	local lastIntent = formatIntent(session.lastIntent)
+	local topic = formatTopic(session.lastTopic)
+
+	return {
+		STATUS_PREFIX .. " " .. messageCount .. ", " .. commandCount .. ", last intent " .. lastIntent .. ".",
+		"distance " .. formatDistance(distance) .. ", recent topic " .. topic .. ".",
+	}
 end
 
 local function sendStatus(player: Player, session: Session)
-	local distance = formatDistance(dummy:distanceTo(player))
-	local topic = summarizeRecentTopic(session)
-	local uptime = tostring(math.floor(os.clock() - startedAt))
-	dummy:say(player, "status: " .. tostring(session.messageCount) .. " msgs, " .. tostring(session.commandCount) .. " cmds, last intent " .. session.lastIntent)
-	task.delay(0.55, function()
-		if player.Parent then
-			dummy:say(player, "distance " .. distance .. ", topic " .. topic .. ", awake " .. uptime .. "s")
-		end
-	end)
+	sendLines(player, buildStatusLines(player, session), HELP_DELAY)
 end
 
--- only exact guide requests get swallowed. if someone says "explain scripting"
--- it should go to the brain, not open the help menu.
-local function isGuideOnlyRequest(message: string): boolean
-	local lower = string.lower(message)
-	return lower == "help"
-		or lower == "commands"
-		or lower == "dummy help"
-		or lower == "what can you do"
-end
+local function memoryLineFromEntry(index: number, entry: any): string
+	-- memory output is clipped because chat bubbles are small
+	-- the full text is still stored in the session ring buffer
+	local role = tostring(entry.role or "unknown")
+	local intent = tostring(entry.intent or "chat")
+	local topic = entry.topic and (" topic=" .. tostring(entry.topic)) or ""
+	local text = tostring(entry.text or "")
 
--- two guide bubbles are delayed a bit so they can actually be read.
-local function sendGuide(player: Player, guide: GuideEntry)
-	task.spawn(function()
-		for _, line in guide.lines do
-			if not player.Parent then
-				return
-			end
-			dummy:say(player, line)
-			task.wait(0.55)
-		end
-	end)
-end
-
--- stats stay tiny. they help prove commands are being tracked without making
--- a datastore, remote event, or some oversized logging system.
-local function shouldCountCommand(intent: string): boolean
-	return intent ~= "chat"
-end
-
-local function updateSessionStats(session: Session, intent: string)
-	session.messageCount += 1
-	session.lastIntent = intent
-	if shouldCountCommand(intent) then
-		session.commandCount += 1
-	end
-end
-
--- rare pulse for longer tests. it is every 12 messages so it will not spam.
-local function maybeReportSession(player: Player, session: Session)
-	if session.messageCount > 0 and session.messageCount % 12 == 0 then
-		task.delay(0.4, function()
-			if player.Parent then
-				dummy:say(player, "session check: " .. tostring(session.messageCount) .. " messages, " .. tostring(session.commandCount) .. " commands, " .. tostring(math.floor(os.clock() - startedAt)) .. "s awake")
-			end
-		end)
-	end
-end
-
--- delayed greeting avoids talking before the player's character exists.
-local function greetPlayer(player: Player)
-	task.delay(1.2, function()
-		if player.Parent and dummy:distanceTo(player) then
-			dummy:say(player, "yo " .. player.DisplayName .. ", say help if you want the command list")
-		end
-	end)
-end
-
--- biggest optimization gate. if the player is too far, spamming, or behind a
--- wall, the dummy does not waste time doing brain analysis or movement work.
-local function playerIsAllowed(player: Player, session: Session): boolean
-	local now = os.clock()
-	if now - session.lastMessageAt < Config.ReplyCooldown then
-		return false
+	if #text > 58 then
+		text = string.sub(text, 1, 58) .. "..."
 	end
 
-	local distance = dummy:distanceTo(player)
-	if not distance or distance > Config.ChatRange then
-		return false
-	end
-
-	if distance > 28 and not dummy:canSee(player) then
-		return false
-	end
-
-	session.lastMessageAt = now
-	return true
+	return tostring(index) .. ". " .. role .. " [" .. intent .. topic .. "] " .. text
 end
 
--- fake thinking delay, clamped so long messages do not freeze the reply.
-local function responseDelay(message: string): number
-	return math.clamp(#message * 0.01, Config.ThinkingSecondsMin, Config.ThinkingSecondsMax)
-end
-
--- returns true only if the guide fully handled the message. this keeps the
--- normal message path from double replying.
-local function handleGuideIfNeeded(player: Player, message: string): boolean
-	local guide = findGuide(message)
-	if not guide then
-		return false
+local function buildMemoryLines(session: Session): { string }
+	-- only show the most recent entries
+	-- the dummy is meant to feel contextual, not dump a wall of chat
+	if #session.memory == 0 then
+		return { MEMORY_PREFIX .. " nothing stored yet." }
 	end
 
-	if isGuideOnlyRequest(message) then
-		sendGuide(player, guide)
+	local lines = {
+		MEMORY_PREFIX .. " last " .. tostring(math.min(#session.memory, 4)) .. " entries.",
+	}
+
+	local startIndex = math.max(1, #session.memory - 3)
+	for index = startIndex, #session.memory do
+		table.insert(lines, memoryLineFromEntry(index, session.memory[index]))
+	end
+
+	return lines
+end
+
+local function sendMemory(player: Player, session: Session)
+	sendLines(player, buildMemoryLines(session), HELP_DELAY)
+end
+
+-- Cooldown is checked before distance or line of sight
+-- it is the cheapest gate and blocks spam before any world queries run
+local function passesCooldown(session: Session): boolean
+	return now() - session.lastMessageAt >= Config.ReplyCooldown
+end
+
+local function passesRange(player: Player): (boolean, number?)
+	-- distance is returned with the bool so status/debug can reuse it
+	-- without asking NpcController for the same value again
+	local distance = dummy:DistanceTo(player)
+	if not distance then
+		return false, nil
+	end
+
+	return distance <= Config.ChatRange, distance
+end
+
+-- Line of sight is only required for farther players
+-- nearby players can still interact naturally if a tiny part blocks the raycast
+local function passesVisibility(player: Player, distance: number): boolean
+	if distance <= FAR_VISIBILITY_DISTANCE then
 		return true
 	end
 
-	return false
+	return dummy:CanSee(player)
 end
 
-local function handleStatusIfNeeded(player: Player, session: Session, message: string): boolean
-	if not isStatusRequest(message) then
+local function authorizePlayer(player: Player, session: Session): GateResult
+	-- this is the server authority gate
+	-- if it returns false, the message does not affect memory, chat, or movement
+	if not passesCooldown(session) then
+		return {
+			ok = false,
+			reason = "cooldown",
+		}
+	end
+
+	local inRange, distance = passesRange(player)
+	if not inRange then
+		return {
+			ok = false,
+			reason = "range",
+			distance = distance,
+		}
+	end
+
+	if distance and not passesVisibility(player, distance) then
+		-- line of sight check is last because it raycasts
+		-- cooldown and range are cheaper and can reject most bad messages first
+		return {
+			ok = false,
+			reason = "visibility",
+			distance = distance,
+		}
+	end
+
+	session.lastMessageAt = now()
+	return {
+		ok = true,
+		distance = distance,
+	}
+end
+
+local function handleRepeatedMessage(player: Player, session: Session, message: string): boolean
+	-- repeated spam is handled before analysis so it does not poison recent topic memory
+	if not sessions:IsRepeated(session, message) then
 		return false
 	end
 
-	sendStatus(player, session)
+	dummy:Say(player, "you already said that. give me a new command.")
 	return true
 end
 
--- full flow is here: clean input, check session rules, remember text, analyze,
--- reply, then execute the command. brain and movement are split so this stays
--- readable instead of becoming one giant messy file.
+local function handleSpecialRequest(player: Player, session: Session, request: SpecialRequest): boolean
+	-- utility commands answer immediately and do not run physical NPC actions
+	if request == "none" then
+		return false
+	end
+
+	if request == "help" then
+		sendHelp(player)
+	elseif request == "status" then
+		sendStatus(player, session)
+	elseif request == "memory" then
+		sendMemory(player, session)
+	elseif request == "demo" then
+		sendDemo(player)
+	elseif request == "about" then
+		sendAbout(player)
+	elseif request == "internals" then
+		sendInternals(player)
+	end
+
+	return true
+end
+
+local function recordUserMessage(session: Session, message: string, analysis)
+	-- user message is stored after analysis so memory includes intent/topic metadata
+	sessions:UpdateStats(session, analysis.intent, analysis.topic)
+	sessions:Push(session, "user", message, analysis.intent, analysis.topic)
+end
+
+local function recordDummyReply(session: Session, reply: string, analysis)
+	-- dummy replies are stored too, which gives the memory command a full short context
+	sessions:Push(session, "dummy", reply, "chat", analysis.topic)
+end
+
+-- NPC actions are isolated from reply generation
+-- if an action fails because a character respawned or target disappeared,
+-- chat memory still remains valid and the server does not break the chat loop
+local function executeAnalysis(player: Player, analysis)
+	local ok = pcall(function()
+		dummy:Execute(player, analysis)
+	end)
+
+	if not ok and playerStillValid(player) then
+		dummy:Say(player, "that command failed during movement. try again when your character is stable.")
+	end
+end
+
+local function scheduleReply(player: Player, session: Session, reply: string, analysis)
+	-- reply and action are delayed together so the dummy feels like it processed chat
+	-- player validity is checked again because task.delay can outlive the player
+	task.delay(responseDelay(analysis.raw), function()
+		if not playerStillValid(player) then
+			return
+		end
+
+		-- reply first, action second
+		-- the player hears confirmation before the dummy starts walking/jumping
+		dummy:Say(player, reply)
+		executeAnalysis(player, analysis)
+		recordDummyReply(session, reply, analysis)
+	end)
+end
+
+local function analyzeAndRespond(player: Player, session: Session, message: string)
+	-- one analysis pass creates both the reply and the action command
+	-- no second parser later in movement code
+	local analysis = brain:Analyze(message, session)
+	local reply = brain:Reply(player, analysis)
+
+	recordUserMessage(session, message, analysis)
+	scheduleReply(player, session, reply, analysis)
+end
+
+-- The message pipeline is intentionally ordered:
+-- 1. normalize cheap input
+-- 2. validate server authority gates
+-- 3. handle built-in utility requests
+-- 4. analyze the message once
+-- 5. reply and execute the resulting action
 local function handleMessage(player: Player, rawMessage: string)
 	local message = normalizeMessage(rawMessage)
 	if not message then
 		return
 	end
 
-	local session = sessionFor(player)
-	if not playerIsAllowed(player, session) then
+	local session = sessions:Get(player)
+	local gate = authorizePlayer(player, session)
+	if not gate.ok then
 		return
 	end
 
-	if updateRepeatState(session, message) then
-		dummy:say(player, "you already said that bro, give me a new command")
+	if handleRepeatedMessage(player, session, message) then
 		return
 	end
 
-	if handleStatusIfNeeded(player, session, message) then
+	local specialRequest = classifySpecialRequest(message)
+	if handleSpecialRequest(player, session, specialRequest) then
 		return
 	end
 
-	if handleGuideIfNeeded(player, message) then
-		return
-	end
+	analyzeAndRespond(player, session, message)
+end
 
-	pushMemory(session, "user", message)
-
-	local analysis = brain:analyze(message, session.memory)
-	local reply = brain:reply(player, analysis)
-	local command = brain:command(analysis)
-	updateSessionStats(session, command.intent)
-
-	task.delay(responseDelay(message), function()
-		if not player.Parent then
-			return
+local function sendGreeting(player: Player)
+	-- greeting is delayed so character replication has time to finish
+	task.delay(GREETING_DELAY, function()
+		if playerStillValid(player) and dummy:DistanceTo(player) then
+			dummy:Say(player, "yo " .. player.DisplayName .. ", say help if you want the command list.")
 		end
-
-		dummy:say(player, reply)
-		dummy:execute(player, command, analysis.lower)
-		pushMemory(session, "dummy", reply)
-		maybeReportSession(player, session)
 	end)
 end
 
--- server owns chat binding and action authority. clients never directly tell
--- the dummy where to move.
-local function bindPlayer(player: Player)
-	sessionFor(player)
-	greetPlayer(player)
+local function connectChat(player: Player)
+	-- using Player.Chatted keeps the demo simple and publishable
+	-- the server still owns every response and action
 	player.Chatted:Connect(function(message)
+		-- all chat enters the same pipeline, no side routes
 		handleMessage(player, message)
 	end)
 end
 
-for _, player in Players:GetPlayers() do
-	bindPlayer(player)
+local function bindPlayer(player: Player)
+	-- session is created before chat binding so the first message has state ready
+	sessions:Get(player)
+	connectChat(player)
+	sendGreeting(player)
 end
 
+local function bindExistingPlayers()
+	for _, player in Players:GetPlayers() do
+		bindPlayer(player)
+	end
+end
+
+local function removePlayer(player: Player)
+	-- per-player memory is released when they leave
+	sessions:Forget(player)
+end
+
+bindExistingPlayers()
 Players.PlayerAdded:Connect(bindPlayer)
-Players.PlayerRemoving:Connect(function(player)
-	sessions[player.UserId] = nil
-end)
+Players.PlayerRemoving:Connect(removePlayer)
