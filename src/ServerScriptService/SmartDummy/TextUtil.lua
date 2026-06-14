@@ -79,11 +79,39 @@ function TextUtil.words(text: string): { string }
 	return list
 end
 
+local function isTokenChar(character: string): boolean
+	return character ~= "" and string.match(character, "[%w_']") ~= nil
+end
+
+local function hasPhraseBoundary(lower: string, phrase: string): boolean
+	phrase = TextUtil.trim(phrase)
+	if phrase == "" then
+		return false
+	end
+
+	local searchFrom = 1
+	while true do
+		local startIndex, endIndex = string.find(lower, phrase, searchFrom, true)
+		if not startIndex or not endIndex then
+			return false
+		end
+
+		local before = string.sub(lower, startIndex - 1, startIndex - 1)
+		local after = string.sub(lower, endIndex + 1, endIndex + 1)
+		if not isTokenChar(before) and not isTokenChar(after) then
+			return true
+		end
+
+		searchFrom = startIndex + 1
+	end
+end
+
 function TextUtil.hasPhrase(lower: string, phrases: { string }): boolean
-	-- phrase checks use plain search, no pattern magic
-	-- player text should not accidentally become a Lua pattern
+	-- phrase checks use plain search plus token boundaries
+	-- "jump" should match "jump now", but not "jumpxeqks"
+	-- this blocks fake words from turning into real commands
 	for _, phrase in phrases do
-		if string.find(lower, phrase, 1, true) then
+		if hasPhraseBoundary(lower, phrase) then
 			return true
 		end
 	end
@@ -182,7 +210,7 @@ function TextUtil.inferIntent(lower: string, list: { string }, intents: { Intent
 
 	for _, intent in intents do
 		for _, phrase in intent.phrases do
-			if string.find(lower, phrase, 1, true) and #phrase > bestLength then
+			if hasPhraseBoundary(lower, phrase) and #phrase > bestLength then
 				bestIntent = intent.name
 				bestLength = #phrase
 			end
@@ -208,14 +236,14 @@ end
 function TextUtil.isQuestion(raw: string, lower: string): boolean
 	-- question marks and common question starts both count
 	return string.find(raw, "?", 1, true) ~= nil
-		or TextUtil.hasPhrase(lower, { "how ", "what ", "why ", "where ", "can you", "do you" })
+		or TextUtil.hasPhrase(lower, { "how", "what", "why", "where", "can you", "do you" })
 end
 
 function TextUtil.isTechnical(lower: string, list: { string }): boolean
 	-- technical detection routes to explanation style replies
 	-- it does not change movement permissions or server gates
 	return TextUtil.hasAny(list, TECH_WORDS)
-		or TextUtil.hasPhrase(lower, { "explain ", "teach me", "how do i", "how does" })
+		or TextUtil.hasPhrase(lower, { "explain", "teach me", "how do i", "how does" })
 end
 
 function TextUtil.isTechnicalWord(word: string): boolean
