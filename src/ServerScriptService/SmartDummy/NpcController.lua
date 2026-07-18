@@ -1,6 +1,15 @@
 -- Connected Discord-GitHub
 --!strict
 
+--[[ npc controller
+
+this module owns the dummy rig and all Roblox movement
+the main script gives Execute an intent that Brain already found
+then this module handles following paths jumping sitting spinning and orbiting
+
+one Heartbeat loop updates follow movement and looking
+commands mostly change the current state instead of making permanent new loops ]]
+
 local Chat = game:GetService("Chat")
 local PathfindingService = game:GetService("PathfindingService")
 local Players = game:GetService("Players")
@@ -30,14 +39,13 @@ type DummyState = "idle" | "following" | "moving" | "sitting" | "performing"
 local NpcController = {}
 NpcController.__index = NpcController
 
--- movement uses flattened vectors a lot because NPC steering should not tilt
--- upward/downward when the player is on a slope or jumping
+-- movement uses flat vectors because player height should not tilt the dummy up or down
 local function flat(vector: Vector3): Vector3
 	return Vector3.new(vector.X, 0, vector.Z)
 end
 
 local function flatUnit(vector: Vector3): Vector3?
-	-- nil instead of Vector3.zero.Unit, because zero-length unit vectors throw bad math
+	-- a zero vector has no direction so i return nil instead of using its Unit
 	local value = flat(vector)
 	if value.Magnitude < 0.001 then
 		return nil
@@ -46,7 +54,7 @@ local function flatUnit(vector: Vector3): Vector3?
 end
 
 local function getRoot(player: Player): BasePart?
-	-- characters can respawn mid-command, so every public action resolves parts fresh
+	-- players can respawn between commands so i get the current character and root each time
 	local character = player.Character
 	if not character then
 		return nil
@@ -63,7 +71,7 @@ local function getHead(player: Player): BasePart?
 end
 
 local function makeRayParams(ignore: { Instance }): RaycastParams
-	-- raycasts ignore the dummy and target character so line checks hit real blockers
+	-- the ray ignores these models so it only finds a real wall or object between them
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = ignore
@@ -72,8 +80,8 @@ local function makeRayParams(ignore: { Instance }): RaycastParams
 end
 
 function NpcController.new()
-	-- this object owns one dummy rig and one runtime loop
-	-- no per-player controllers, because the NPC is shared server state
+	-- there is one controller because every player talks to the same dummy
+	-- this table holds the current movement look target path and connections
 	local self = setmetatable({
 		_parts = nil :: RigParts?,
 		_state = "idle" :: DummyState,
@@ -98,8 +106,7 @@ function NpcController.new()
 end
 
 function NpcController:_createRuntimeRig(): Model
-	-- if the place owner did not drop in a custom AIDummy model, make a clean R15 one
-	-- this keeps the demo publishable without forcing extra manual setup
+	-- if there is no custom AIDummy in Workspace i make a normal R15 one here
 	local description = Instance.new("HumanoidDescription")
 	local ok, generated = pcall(function()
 		return Players:CreateHumanoidModelFromDescription(description, Enum.HumanoidRigType.R15)
@@ -114,10 +121,9 @@ function NpcController:_createRuntimeRig(): Model
 	return generated
 end
 
--- Network ownership is forced to the server
--- NPC movement should not depend on whichever client happens to be closest
--- this matters for follow/path actions because client-owned physics can jitter
--- or desync when several players are near the dummy
+--[[ the server gets network ownership of every rig part
+the server is deciding the movement so a nearby player should not take over its physics
+this also keeps the dummy movement the same for everyone ]]
 function NpcController:_resolveRig(): RigParts
 	local model = Workspace:FindFirstChild(Config.DummyName)
 	if not model or not model:IsA("Model") then
@@ -148,8 +154,7 @@ function NpcController:_resolveRig(): RigParts
 end
 
 function NpcController:_configureHumanoid()
-	-- AutoRotate is disabled because this controller handles facing manually
-	-- with CFrame.lookAt, otherwise Roblox humanoid rotation fights our smoothing
+	-- AutoRotate is off because _facePosition handles the smooth turning itself
 	local parts = self._parts :: RigParts
 	parts.humanoid.AutoRotate = false
 	parts.humanoid.WalkSpeed = self._walkSpeed
@@ -163,9 +168,9 @@ function NpcController:_configureHumanoid()
 	end)
 end
 
--- One Heartbeat loop owns persistent behavior: following, facing, and cleanup
--- commands only change state, this loop is what actually advances that state
--- cheaper and cleaner than spawning many loops per command
+--[[ these are the three runtime connections
+HealthChanged keeps the demo dummy alive MoveToFinished changes waypoints
+and Heartbeat updates following looking and finished action state ]]
 function NpcController:_connectRuntime()
 	local parts = self._parts :: RigParts
 	table.insert(self._connections, parts.humanoid.HealthChanged:Connect(function()
@@ -187,17 +192,16 @@ function NpcController:_connectRuntime()
 end
 
 function NpcController:_clearPath()
-	-- path state is reused instead of replacing the table every time
-	-- less garbage, and no old waypoint list accidentally survives
+	-- clear every path value so an old waypoint cannot affect the next move
+	-- i reuse the table because following can clear paths many times
 	self._path.active = false
 	self._path.goal = nil
 	table.clear(self._path.waypoints)
 	self._path.index = 1
 end
 
--- Pathfinding is throttled by target movement and time
--- recomputing every Heartbeat is expensive and usually worse because the
--- humanoid keeps getting a new route before it can finish the current one
+--[[ paths are not made every frame because that would waste work and restart the route
+the old path is reused until enough time passes or the goal moves far enough ]]
 function NpcController:_computePath(goal: Vector3): boolean
 	local parts = self._parts :: RigParts
 	local now = os.clock()
@@ -215,8 +219,7 @@ function NpcController:_computePath(goal: Vector3): boolean
 		WaypointSpacing = 4,
 	})
 
-	-- ComputeAsync can fail if the navmesh is not ready or the target is invalid
-	-- pcall keeps one bad path request from killing the whole NPC controller
+	-- ComputeAsync can fail for a bad goal or navmesh so pcall keeps the controller running
 	local ok = pcall(function()
 		path:ComputeAsync(parts.root.Position, goal)
 	end)
@@ -232,8 +235,8 @@ function NpcController:_computePath(goal: Vector3): boolean
 end
 
 function NpcController:_advancePath()
-	-- MoveToFinished advances this index
-	-- jump waypoints are handled here so pathfinding can climb simple obstacles
+	-- MoveToFinished moves the index then calls this for the next waypoint
+	-- if that waypoint needs a jump the Humanoid jumps before moving to it
 	local parts = self._parts :: RigParts
 	local waypoint = self._path.waypoints[self._path.index]
 	if not waypoint then
@@ -251,8 +254,8 @@ function NpcController:_advancePath()
 end
 
 function NpcController:_moveTo(goal: Vector3, state: DummyState?)
-	-- all direct movement funnels through here
-	-- pathfinding is preferred, but MoveTo fallback keeps simple flat moves responsive
+	-- all move commands use this so path and fallback behavior stays in one place
+	-- a good path is used first and direct MoveTo is the fallback
 	local parts = self._parts :: RigParts
 	if flat(goal - parts.root.Position).Magnitude < 1 then
 		return
@@ -267,9 +270,7 @@ function NpcController:_moveTo(goal: Vector3, state: DummyState?)
 end
 
 function NpcController:_nearestPlayer(maxDistance: number): Player?
-	-- idle facing chooses the nearest player inside a capped radius
-	-- small loop over Players is fine here because it runs once per Heartbeat
-	-- and only compares root positions
+	-- when there is no main target i find the closest player in FaceRange to look at
 	local parts = self._parts :: RigParts
 	local bestPlayer = nil :: Player?
 	local bestDistance = maxDistance
@@ -286,9 +287,8 @@ function NpcController:_nearestPlayer(maxDistance: number): Player?
 	return bestPlayer
 end
 
--- CFrame.lookAt gives the target rotation
--- exponential Lerp makes the rotation smooth and frame-rate independent
--- so 30 fps and 144 fps clients see the same style of turn
+--[[ CFrame.lookAt gets the rotation toward the player and Lerp smooths the turn
+deltaTime is used in alpha so the turn speed stays similar at different frame rates ]]
 function NpcController:_facePosition(position: Vector3, deltaTime: number, responsiveness: number)
 	local parts = self._parts :: RigParts
 	local target = Vector3.new(position.X, parts.root.Position.Y, position.Z)
@@ -302,8 +302,7 @@ function NpcController:_facePosition(position: Vector3, deltaTime: number, respo
 end
 
 function NpcController:_focusTarget(): Player?
-	-- follow target wins, then recent speaker, then nearest player
-	-- this makes the dummy feel aware without doing any client-side camera tricks
+	-- follow target comes first then the recent speaker and then the closest player
 	if self._followPlayer then
 		return self._followPlayer
 	end
@@ -314,8 +313,7 @@ function NpcController:_focusTarget(): Player?
 end
 
 function NpcController:_stepFollow()
-	-- follow mode keeps a gap instead of walking into the player
-	-- when close enough, it stops issuing MoveTo calls so it does not jitter
+	-- follow mode keeps a gap and stops sending goals when the dummy is close enough
 	local player = self._followPlayer
 	if not player then
 		return
@@ -332,15 +330,14 @@ function NpcController:_stepFollow()
 	local parts = self._parts :: RigParts
 	local distance = flat(playerRoot.Position - parts.root.Position).Magnitude
 	if distance <= Config.FollowStopDistance then
-		-- already close enough, so stop pushing new goals
-		-- this removes the common follow jitter where NPCs shuffle forever
+		-- clear the path here so the dummy does not keep shuffling near the player
 		parts.humanoid:Move(Vector3.zero, false)
 		self:_clearPath()
 		return
 	end
 
 	if distance < Config.FollowResumeDistance and self._path.active then
-		-- wait for current path to finish unless the player moved far enough away
+		-- keep finishing the current path until the player passes the resume distance
 		return
 	end
 
@@ -350,8 +347,7 @@ function NpcController:_stepFollow()
 end
 
 function NpcController:_step(deltaTime: number)
-	-- one frame step for all persistent behavior
-	-- no command code should connect its own endless Heartbeat loop
+	-- this one frame step handles all behavior that needs to keep updating
 	if self._state == "following" then
 		self:_stepFollow()
 	end
@@ -369,8 +365,8 @@ function NpcController:_step(deltaTime: number)
 end
 
 function NpcController:CanSee(player: Player): boolean
-	-- server-side line of sight blocks far-away chat through walls
-	-- close players are handled by SmartDummyController so small props do not feel annoying
+	--[[ for a far player i raycast from the dummy head to the players root
+the main script skips this at close range so a small nearby part does not block chat ]]
 	local parts = self._parts :: RigParts
 	local root = getRoot(player)
 	if not root then
@@ -397,23 +393,20 @@ function NpcController:DistanceTo(player: Player): number?
 end
 
 function NpcController:Focus(player: Player, seconds: number?)
-	-- focus is just a timed look target
-	-- it gives replies physical direction without permanently locking onto someone
+	-- save this player as the look target until the timer ends
 	self._focusPlayer = player
 	self._focusUntil = os.clock() + (seconds or 7)
 end
 
 function NpcController:Say(player: Player, text: string)
-	-- chat bubbles come from the dummy head, not a custom client UI
-	-- simple, replicated, and easy to read in normal play
+	-- use Roblox Chat on the dummy head so every player sees the same reply bubble
 	local parts = self._parts :: RigParts
 	self:Focus(player, 7)
 	Chat:Chat(parts.head, text, Enum.ChatColor.White)
 end
 
 function NpcController:Follow(player: Player)
-	-- follow starts state only
-	-- actual distance control happens in _stepFollow so it updates as player moves
+	-- this starts follow state and _stepFollow keeps updating it as the player moves
 	local parts = self._parts :: RigParts
 	self._followPlayer = player
 	self._state = "following"
@@ -423,8 +416,7 @@ function NpcController:Follow(player: Player)
 end
 
 function NpcController:Stop()
-	-- clearing follow and path is important
-	-- otherwise a previous MoveTo/path callback could keep pulling the dummy around
+	-- clear follow path and Humanoid movement so an old command cannot keep moving it
 	local parts = self._parts :: RigParts
 	self._followPlayer = nil
 	self._state = "idle"
@@ -434,8 +426,7 @@ function NpcController:Stop()
 end
 
 function NpcController:ComeTo(player: Player)
-	-- "come here" is a one-shot move, different from follow
-	-- the target point is offset from the player so the dummy stops like a pet would
+	-- come here is one move instead of follow and the offset leaves a gap by the player
 	local parts = self._parts :: RigParts
 	local root = getRoot(player)
 	if not root then
@@ -449,8 +440,7 @@ function NpcController:ComeTo(player: Player)
 end
 
 function NpcController:MoveRelative(player: Player, direction: string?, distance: number?)
-	-- relative movement uses the player's facing direction when possible
-	-- so "move right" means the player's right, not world +X
+	-- use the players CFrame so left right forward and back are from their view
 	local parts = self._parts :: RigParts
 	local playerRoot = getRoot(player)
 	local basis = if playerRoot then playerRoot.CFrame else parts.root.CFrame
@@ -473,9 +463,8 @@ function NpcController:MoveRelative(player: Player, direction: string?, distance
 	end
 end
 
--- "go there" raycasts from the player's facing direction
--- that gives target selection without trusting a client RemoteEvent or mouse hit
--- if the ray hits nothing, the fallback point is still in front of the player
+--[[ go there uses a server ray from the direction the player is facing
+the client does not send a mouse position and if nothing is hit i use a point in front ]]
 function NpcController:GoThere(player: Player)
 	local parts = self._parts :: RigParts
 	local root = getRoot(player)
@@ -490,8 +479,7 @@ function NpcController:GoThere(player: Player)
 		table.insert(ignore, player.Character)
 	end
 
-	-- forward plus a downward bias makes "go there" hit floors/ramps more often
-	-- instead of firing a perfectly flat ray over the target surface
+	-- the ray points down a little so it can hit a floor or ramp instead of going over it
 	local result = Workspace:Raycast(origin, root.CFrame.LookVector * Config.GoThereDistance - Vector3.yAxis * 12, makeRayParams(ignore))
 	local goal = if result then result.Position else root.Position + root.CFrame.LookVector * 24
 	self._followPlayer = nil
@@ -500,8 +488,8 @@ function NpcController:GoThere(player: Player)
 end
 
 function NpcController:Jump(count: number)
-	-- jump count is clamped so "jump 999" cannot create a long task spam chain
-	-- the small velocity boost makes the jump visibly clear even on default rigs
+	-- the count is limited to six so one message cannot start a very long jump task
+	-- i also add upward speed so each jump is clear on the R15 rig
 	local parts = self._parts :: RigParts
 	count = math.clamp(math.floor(count), 1, 6)
 	self._state = "performing"
@@ -509,7 +497,7 @@ function NpcController:Jump(count: number)
 
 	task.spawn(function()
 		for _ = 1, count do
-			-- Sit has to be cleared before jumping or the humanoid may ignore the impulse
+			-- clear Sit first because a sitting Humanoid may ignore the jump
 			parts.humanoid.Sit = false
 			parts.humanoid.Jump = true
 			parts.root.AssemblyLinearVelocity += Vector3.new(0, 18, 0)
@@ -522,7 +510,7 @@ function NpcController:Jump(count: number)
 end
 
 function NpcController:Sit(shouldSit: boolean)
-	-- sitting cancels movement because Humanoid.Sit and path movement do not mix cleanly
+	-- sitting clears follow and path movement first because they should not run together
 	local parts = self._parts :: RigParts
 	self._followPlayer = nil
 	self:_clearPath()
@@ -531,8 +519,7 @@ function NpcController:Sit(shouldSit: boolean)
 end
 
 function NpcController:Spin(seconds: number)
-	-- timed cosmetic action
-	-- CFrame rotation is done server side so every player sees the same spin
+	-- spin turns the root on the server for a limited time so everyone sees it
 	local parts = self._parts :: RigParts
 	seconds = TextUtil.clampNumber(seconds, 1.6, 0.5, 5)
 	self._state = "performing"
@@ -548,9 +535,8 @@ function NpcController:Spin(seconds: number)
 end
 
 function NpcController:Orbit(player: Player, seconds: number)
-	-- orbit is not physics based
-	-- it samples positions around the player and sends short MoveTo/path goals
-	-- this stays simple and avoids constraints or body movers fighting the humanoid
+	--[[ orbit makes points in a circle around the player and moves between them
+it still uses _moveTo so normal pathfinding can handle things in the way ]]
 	seconds = TextUtil.clampNumber(seconds, 4, 1.5, 8)
 	self._followPlayer = nil
 	self._state = "performing"
@@ -563,8 +549,7 @@ function NpcController:Orbit(player: Player, seconds: number)
 			if not root then
 				break
 			end
-			-- circular offset is sampled over time
-			-- pathing still handles obstacles if the orbit point is not directly reachable
+			-- sin and cos turn the timer into the next position around the circle
 			local angle = (os.clock() - started) * math.pi * 1.35
 			local offset = Vector3.new(math.cos(angle) * Config.FollowStopDistance, 0, math.sin(angle) * Config.FollowStopDistance)
 			self:_moveTo(root.Position + offset, "performing")
@@ -574,8 +559,8 @@ function NpcController:Orbit(player: Player, seconds: number)
 end
 
 function NpcController:SetSpeed(message: string, number: number?)
-	-- speed accepts direct numbers and soft language like faster/slower/normal
-	-- final value is clamped so the dummy cannot be made unusably slow or insane fast
+	-- speed accepts a number or words like faster slower and normal
+	-- the final value is always kept inside the min and max from Config
 	local parts = self._parts :: RigParts
 	local speed = self._walkSpeed
 	if number then
@@ -593,9 +578,7 @@ function NpcController:SetSpeed(message: string, number: number?)
 end
 
 function NpcController:Execute(player: Player, analysis)
-	-- dispatcher from parsed intent to Roblox action
-	-- Brain decides what the player meant, this module decides what the dummy does
-	-- no raw phrase matching belongs here
+	-- Brain already read the text so this only runs the action for its finished intent
 	if analysis.intent == "follow" then
 		self:Follow(player)
 	elseif analysis.intent == "stop" then

@@ -1,4 +1,12 @@
+-- Connected Discord-GitHub
 --!strict
+
+--[[ command registry
+
+every dummy command is written once in COMMANDS
+Brain uses the phrases and words to find an intent
+the main script uses the examples and api notes for help messages
+NpcController has the movement code so this module only describes the commands ]]
 
 local TextUtil = require(script.Parent.TextUtil)
 
@@ -17,12 +25,7 @@ export type CommandSpec = {
 
 local CommandRegistry = {}
 
--- this is the main line between "hardcoded bot" and "local command system"
--- the table below describes commands, but it does not run them
--- Brain reads this metadata to understand chat, SmartDummyController uses it
--- for help/debug text, and NpcController is the only module that touches the
--- actual Humanoid, CFrame, raycast, and pathfinding behavior
--- so if i tune a command later, the parser and the player-facing docs stay in sync
+-- each entry keeps the matching words help info and reply for one command together
 local COMMANDS = {
 	{
 		id = "follow",
@@ -144,9 +147,8 @@ local COMMANDS = {
 	},
 } :: { CommandSpec }
 
--- these are utility requests, not NPC actions
--- they are exact aliases because commands like "status" and "memory" should be
--- predictable and not fight the normal brain response logic
+--[[ these commands only show information and never move the dummy
+i match the whole message here so saying "explain memory" does not open the memory list ]]
 local UTILITY_ALIASES = {
 	help = { "help", "commands", "what can you do", "dummy help" },
 	status = { "status", "stats", "session", "what are you doing" },
@@ -158,13 +160,12 @@ local UTILITY_ALIASES = {
 
 local byId = {}
 for _, command in COMMANDS do
-	-- id map makes command lookup O(1) and avoids scanning COMMANDS everywhere
+	-- this map lets the functions below get a command by id without looping the full list
 	byId[command.id] = command
 end
 
 function CommandRegistry.IntentRules(): { TextUtil.Intent }
-	-- TextUtil only needs phrase/word rules, not the full command object
-	-- this keeps the text parser small and stops it from knowing about UI/help data
+	-- TextUtil only needs the matching parts so i leave out help and reply data here
 	local rules = {}
 	for _, command in COMMANDS do
 		table.insert(rules, {
@@ -177,23 +178,20 @@ function CommandRegistry.IntentRules(): { TextUtil.Intent }
 end
 
 function CommandRegistry.Get(id: string): CommandSpec?
-	-- constant lookup by id, used when other modules need command details
+	-- get the full command entry from its id
 	return byId[id]
 end
 
 function CommandRegistry.Commands(): { CommandSpec }
-	-- returns the canonical command list, never rebuild separate command arrays
+	-- return the same command list instead of making another one
 	return COMMANDS
 end
 
 function CommandRegistry.MatchUtility(lowerMessage: string): string?
-	-- utility commands are only matched when the whole message is the alias
-	-- this avoids random words inside normal chat accidentally opening status/help
+	-- utility commands only work when the full message matches an alias
 	for id, aliases in UTILITY_ALIASES do
 		for _, alias in aliases do
-			-- exact match is intentional here
-			-- "can you explain memory" should be a normal technical reply,
-			-- not the memory dump command
+			-- for example memory opens the list but explain memory stays normal chat
 			if lowerMessage == alias then
 				return id
 			end
@@ -203,7 +201,7 @@ function CommandRegistry.MatchUtility(lowerMessage: string): string?
 end
 
 local function collectExamples(category: CommandCategory): { string }
-	-- examples are generated from the command specs so help never goes stale
+	-- collect the examples for one command type when help is built
 	local examples = {}
 	for _, command in COMMANDS do
 		if command.category == category then
@@ -214,8 +212,7 @@ local function collectExamples(category: CommandCategory): { string }
 end
 
 local function uniqueApiNotes(): { string }
-	-- used by the internals response to show which Roblox APIs the system uses
-	-- duplicate notes get collapsed so the output stays readable
+	-- keep one copy of each api note so the internals reply is not full of repeats
 	local seen = {}
 	local notes = {}
 	for _, command in COMMANDS do
@@ -230,7 +227,7 @@ local function uniqueApiNotes(): { string }
 end
 
 local function joinFirst(values: { string }, limit: number): string
-	-- chat bubbles should be short, so only expose the first few examples
+	-- chat bubbles are small so only join the first few items
 	local clipped = {}
 	for index = 1, math.min(#values, limit) do
 		table.insert(clipped, values[index])
@@ -239,7 +236,7 @@ local function joinFirst(values: { string }, limit: number): string
 end
 
 function CommandRegistry.BuildHelpLines(): { string }
-	-- help is built from metadata, not a second manual list
+	-- help is made from COMMANDS so adding a command also updates the help list
 	local movement = collectExamples("movement")
 	local actions = collectExamples("action")
 	return {
@@ -250,8 +247,7 @@ function CommandRegistry.BuildHelpLines(): { string }
 end
 
 function CommandRegistry.BuildDemoLines(): { string }
-	-- the demo chain is intentionally ordered to show movement, pathing, action,
-	-- speed tuning, orbiting, then cleanup
+	-- the demo starts with movement then shows actions and ends with stop
 	local sequence = {}
 	for _, id in { "follow", "move", "go_there", "multi_jump", "speed", "orbit", "stop" } do
 		local command = byId[id]
@@ -266,7 +262,7 @@ function CommandRegistry.BuildDemoLines(): { string }
 end
 
 function CommandRegistry.BuildArchitectureLines(): { string }
-	-- this explains the actual module split in-game without exposing code noise
+	-- these lines show how Brain SessionStore and NpcController work together
 	return {
 		"architecture: Brain parses chat, SessionStore tracks memory, NpcController owns Roblox movement.",
 		"authority: the server validates range, cooldown, and line of sight before any NPC action runs.",
@@ -275,7 +271,7 @@ function CommandRegistry.BuildArchitectureLines(): { string }
 end
 
 function CommandRegistry.BuildInternalsLines(): { string }
-	-- this is the technical version of help, useful for showing API coverage
+	-- this is the more technical help reply and shows the Roblox api being used
 	local apiNotes = uniqueApiNotes()
 	return {
 		"api surface: " .. joinFirst(apiNotes, 6),
@@ -285,8 +281,7 @@ function CommandRegistry.BuildInternalsLines(): { string }
 end
 
 function CommandRegistry.BuildCommandReply(id: string, direction: string?, seedText: string): string?
-	-- replies are generated from the command spec plus deterministic variation
-	-- not a huge phrase-by-phrase response table
+	-- use the reply from the command entry and add one small ending for some variety
 	local command = byId[id]
 	if not command then
 		return nil

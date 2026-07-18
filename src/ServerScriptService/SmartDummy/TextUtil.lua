@@ -1,4 +1,11 @@
+-- Connected Discord-GitHub
 --!strict
+
+--[[ text helper module
+
+Brain uses these functions to split messages and find numbers topics directions and tone
+CommandRegistry also uses them when matching commands
+keeping the checks here means both modules read text the same way ]]
 
 export type Intent = {
 	name: string,
@@ -9,7 +16,7 @@ export type Intent = {
 local TextUtil = {}
 
 local function makeSet(values: { string }): { [string]: boolean }
-	-- frozen sets make membership checks cheap and stop accidental runtime edits
+	-- i turn word lists into sets so checking one word does not need another loop
 	local set = {}
 	for _, value in values do
 		set[value] = true
@@ -17,9 +24,8 @@ local function makeSet(values: { string }): { [string]: boolean }
 	return table.freeze(set)
 end
 
--- These dictionaries are intentionally small
--- this is not pretending to be a real LLM
--- they provide cheap local signals for intent, tone, and topic
+-- these lists are small because they only give Brain a basic topic and tone
+-- this is still a rule based system and does not call an ai service
 local STOP_WORDS = makeSet({
 	"a", "about", "am", "an", "and", "are", "at", "be", "bro", "bruh", "can", "do", "for",
 	"from", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "so", "that",
@@ -62,15 +68,13 @@ local NEGATIVE_WORDS = table.freeze({
 })
 
 function TextUtil.trim(text: string): string
-	-- Roblox chat can include leading/trailing spaces, strip them before gates run
+	-- remove spaces from both ends before the main script checks the message
 	text = string.gsub(text, "^%s+", "")
 	text = string.gsub(text, "%s+$", "")
 	return text
 end
 
--- All parsing starts with normalized word tokens
--- the rest of the system avoids repeatedly searching raw strings,
--- which keeps command behavior predictable
+-- make one lowercase word list that all the other checks can reuse
 function TextUtil.words(text: string): { string }
 	local list = {}
 	for word in string.gmatch(string.lower(text), "[%w_']+") do
@@ -107,9 +111,7 @@ local function hasPhraseBoundary(lower: string, phrase: string): boolean
 end
 
 function TextUtil.hasPhrase(lower: string, phrases: { string }): boolean
-	-- phrase checks use plain search plus token boundaries
-	-- "jump" should match "jump now", but not "jumpxeqks"
-	-- this blocks fake words from turning into real commands
+	-- check both sides so jump matches "jump now" but not a fake word like "jumpabc"
 	for _, phrase in phrases do
 		if hasPhraseBoundary(lower, phrase) then
 			return true
@@ -147,16 +149,15 @@ function TextUtil.firstNumber(list: { string }): number?
 end
 
 function TextUtil.clampNumber(value: number?, fallback: number, minValue: number, maxValue: number): number
-	-- every number from chat goes through one clamp helper
-	-- protects movement distance, jump count, orbit time, and speed
+	--[[ every number from chat comes here before it changes movement
+missing or bad numbers use the fallback and real numbers stay inside the limits ]]
 	if typeof(value) ~= "number" or value ~= value then
 		value = fallback
 	end
 	return math.clamp(value, minValue, maxValue)
 end
 
--- Deterministic selection gives variety without random state
--- the same message chooses the same reply, which feels stable and easier to debug
+-- use the message letters to pick a reply so the same message gets the same choice
 function TextUtil.pick(options: { string }, seedText: string): string
 	local seed = 0
 	for index = 1, #seedText do
@@ -166,8 +167,7 @@ function TextUtil.pick(options: { string }, seedText: string): string
 end
 
 function TextUtil.sentiment(list: { string }): number
-	-- simple tone score
-	-- it only decides reply style, never physical NPC behavior
+	-- add the known word scores to get a simple positive or negative tone
 	local score = 0
 	for _, word in list do
 		score += POSITIVE_WORDS[word] or 0
@@ -177,8 +177,7 @@ function TextUtil.sentiment(list: { string }): number
 end
 
 function TextUtil.topic(list: { string }): string?
-	-- first useful word becomes the topic
-	-- not perfect language understanding, but good enough for short chat context
+	-- skip common words and keep the first useful word as the message topic
 	for _, word in list do
 		if #word >= 4 and not STOP_WORDS[word] then
 			return word
@@ -188,7 +187,7 @@ function TextUtil.topic(list: { string }): string?
 end
 
 function TextUtil.direction(list: { string }): string?
-	-- direction is separated from intent because several commands can use it
+	-- direction is found separately because the move command needs it with the intent
 	if TextUtil.hasWord(list, "left") then
 		return "left"
 	elseif TextUtil.hasWord(list, "right") then
@@ -201,9 +200,8 @@ function TextUtil.direction(list: { string }): string?
 	return nil
 end
 
--- Phrase rules run before word rules, but phrase priority also matters
--- longest matching phrase wins, so "stop following" beats the shorter "follow"
--- this fixes command overlap without relying on fragile command order
+--[[ full phrases are checked before single words and the longest match wins
+this is why "stop following" becomes stop instead of matching the word follow ]]
 function TextUtil.inferIntent(lower: string, list: { string }, intents: { Intent }): string
 	local bestIntent = nil :: string?
 	local bestLength = 0
@@ -234,14 +232,13 @@ function TextUtil.inferIntent(lower: string, list: { string }, intents: { Intent
 end
 
 function TextUtil.isQuestion(raw: string, lower: string): boolean
-	-- question marks and common question starts both count
+	-- check common question starts too because players do not always type a question mark
 	return string.find(raw, "?", 1, true) ~= nil
 		or TextUtil.hasPhrase(lower, { "how", "what", "why", "where", "can you", "do you" })
 end
 
 function TextUtil.isTechnical(lower: string, list: { string }): boolean
-	-- technical detection routes to explanation style replies
-	-- it does not change movement permissions or server gates
+	-- this only tells Brain to use a tech reply and does not run an action
 	return TextUtil.hasAny(list, TECH_WORDS)
 		or TextUtil.hasPhrase(lower, { "explain", "teach me", "how do i", "how does" })
 end

@@ -1,4 +1,11 @@
+-- Connected Discord-GitHub
 --!strict
+
+--[[ session store
+
+each player gets their own small table with recent chat and a few stats
+the main script saves messages here and Brain asks for the last topic
+the sessions stay here so Brain only has to focus on reading text ]]
 
 local Config = require(script.Parent.Config)
 local TextUtil = require(script.Parent.TextUtil)
@@ -25,16 +32,14 @@ local SessionStore = {}
 SessionStore.__index = SessionStore
 
 function SessionStore.new()
-	-- sessions are keyed by UserId, not Player object
-	-- safer if Roblox swaps player instances around during join/leave edge cases
+	-- UserId is used as the key so every player has a separate session
 	return setmetatable({
 		_sessions = {} :: { [number]: Session },
 	}, SessionStore)
 end
 
 function SessionStore:Get(player: Player): Session
-	-- lazy create keeps setup cheap
-	-- a player only gets memory after they actually exist on the server
+	-- only make a new session if this player does not already have one
 	local session = self._sessions[player.UserId]
 	if session then
 		return session
@@ -55,13 +60,12 @@ function SessionStore:Get(player: Player): Session
 end
 
 function SessionStore:Forget(player: Player)
-	-- cleanup matters because this table would otherwise keep old chat memory alive
+	-- forget the session when the player leaves so old memory does not stay in the table
 	self._sessions[player.UserId] = nil
 end
 
--- Memory is capped on purpose
--- the dummy only needs recent context for things like "explain that"
--- storing unlimited chat is wasted memory and not useful for this local brain
+--[[ recent messages are enough for follow up chat like "explain that"
+when the limit is passed i remove the oldest entry so memory cannot keep growing ]]
 function SessionStore:Push(session: Session, role: "user" | "dummy", text: string, intent: string, topic: string?)
 	table.insert(session.memory, {
 		role = role,
@@ -76,8 +80,7 @@ function SessionStore:Push(session: Session, role: "user" | "dummy", text: strin
 end
 
 function SessionStore:RecentTopic(session: Session): string?
-	-- newest topic wins
-	-- if the latest stats are empty, scan memory backwards for a usable topic
+	-- lastTopic is normally used but older memory is checked if it is empty
 	if session.lastTopic then
 		return session.lastTopic
 	end
@@ -92,8 +95,7 @@ function SessionStore:RecentTopic(session: Session): string?
 end
 
 function SessionStore:UpdateStats(session: Session, intent: string, topic: string?)
-	-- stats are kept small: total messages, command count, last intent, last topic
-	-- enough for status/debug without making this a database
+	-- these are the only stats needed for the status reply and recent topic
 	session.messageCount += 1
 	session.lastIntent = intent
 	if topic then
@@ -105,8 +107,8 @@ function SessionStore:UpdateStats(session: Session, intent: string, topic: strin
 end
 
 function SessionStore:IsRepeated(session: Session, message: string): boolean
-	-- repeated message detection is normalized, so whitespace/case changes do not bypass it
-	-- the third repeat is where the dummy pushes back
+	-- lowercase and trim the message so changing capitals or outside spaces is still a repeat
+	-- the third copy returns true and the main script blocks it
 	local normalized = string.lower(TextUtil.trim(message))
 	if normalized == session.lastNormalized then
 		session.repeatCount += 1

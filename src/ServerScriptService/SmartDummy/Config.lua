@@ -1,18 +1,16 @@
+-- Connected Discord-GitHub
 --!strict
 
--- Central config keeps tuning values away from logic. Movement feel, cooldowns,
--- and chat limits can be changed without digging through controller methods.
+--[[ all settings for the dummy are kept here
+this means i can change chat limits movement and reply timing without searching each module
+NpcController uses the movement values and the main script uses the chat values ]]
 local Config = {
-	-- identity / default spawn
-	-- if a custom rig named AIDummy exists, the controller uses it
-	-- otherwise it creates a runtime R15 dummy at this CFrame
+	-- use this model name or make an R15 dummy at the spawn point if it is missing
 	DummyName = "AIDummy",
 	DisplayName = "Roufox",
 	SpawnCFrame = CFrame.new(0, 4, -14),
 
-	-- chat authority limits
-	-- range and line of sight stop far-away players from controlling the NPC
-	-- cooldown keeps repeated chat from doing expensive parsing/action work
+	-- the server checks range sight cooldown and message size before Brain handles the chat
 	ChatRange = 95,
 	FaceRange = 90,
 	LineOfSightRange = 105,
@@ -20,30 +18,28 @@ local Config = {
 	MaxMessageLength = 190,
 	MemoryLimit = 10,
 
-	-- humanoid movement feel
-	-- min/max caps matter because players can ask for speed changes through chat
+	-- players can change speed through chat so i keep it between these two limits
 	WalkSpeed = 13,
 	MinWalkSpeed = 6,
 	MaxWalkSpeed = 38,
 	JumpPower = 52,
 
-	-- spacing / directed movement
-	-- follow uses two distances to avoid jitter around the exact stop distance
+	-- follow stops at one distance and only starts again after the player moves farther away
+	-- using two values stops the dummy from moving back and forth near the player
 	FollowStopDistance = 10,
 	FollowResumeDistance = 14,
 	MoveStepDistance = 10,
 	MaxDirectedMove = 48,
 	GoThereDistance = 78,
 
-	-- pathing and animation tuning
-	-- refresh is not instant on purpose, PathfindingService should not run every frame
+	-- path refresh stops PathfindingService from running every frame
+	-- the two turn values control looking while idle and while moving
 	PathRefreshSeconds = 0.42,
 	PathGoalEpsilon = 3.5,
 	IdleTurnResponsiveness = 8.5,
 	MovingTurnResponsiveness = 5.8,
 
-	-- reply pacing
-	-- gives the dummy a short thinking beat without making chat feel delayed
+	-- the reply delay is kept between these values so chat still feels quick
 	ThinkingSecondsMin = 0.16,
 	ThinkingSecondsMax = 0.72,
 }

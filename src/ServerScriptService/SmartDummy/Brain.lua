@@ -1,4 +1,12 @@
+-- Connected Discord-GitHub
 --!strict
+
+--[[ brain module
+
+this module reads the players message and turns it into simple values like
+intent direction number and topic
+it also makes the reply but it never moves the dummy
+NpcController gets the finished values and handles the actual action ]]
 
 local CommandRegistry = require(script.Parent.CommandRegistry)
 local TextUtil = require(script.Parent.TextUtil)
@@ -20,36 +28,31 @@ local Brain = {}
 Brain.__index = Brain
 
 function Brain.new(recentTopicProvider: (any) -> string?)
-	-- the brain does not own session storage directly
-	-- it asks for recent topic through this callback so memory can stay in SessionStore
+	-- i pass this function in so Brain can use memory without storing sessions itself
 	return setmetatable({
 		_recentTopicProvider = recentTopicProvider,
 	}, Brain)
 end
 
--- Analyze converts one chat message into a compact read of what the player means
--- this is the important part: movement code never parses raw text
--- it gets intent/direction/number/topic, which is way cleaner than making every
--- NPC action search strings by itself
+--[[ the message only gets read once here
+first it is turned into lowercase words then the helpers find the command and extra values
+the main script can use one result for both the reply and the npc action ]]
 function Brain:Analyze(message: string, session: any): Analysis
 	local lower = string.lower(message)
 	local list = TextUtil.words(message)
 	local number = TextUtil.firstNumber(list)
 	local intent = TextUtil.inferIntent(lower, list, CommandRegistry.IntentRules())
 
-	-- jump has a small upgrade path because players say it in many ways
-	-- "double jump", "triple jump", or "jump 4" all become the same action intent
+	-- all ways of asking for more than one jump go through the same action
 	if intent == "jump" and (TextUtil.hasPhrase(lower, { "double", "triple", "quadruple" }) or (number and number > 1)) then
 		intent = "multi_jump"
 		if not number then
-			-- no number was typed, so the common wording decides the count
-			-- this keeps "triple jump" readable in chat without forcing "jump 3"
+			-- if they said triple or quadruple without a number i get the amount from that word
 			number = if string.find(lower, "triple", 1, true) then 3 elseif string.find(lower, "quadruple", 1, true) then 4 else 2
 		end
 	end
 
-	-- this return table is the whole contract between brain and controller
-	-- raw/lower are kept for replies, the rest is cleaned data for action code
+	-- raw and lower are useful for replies and the other values are used by NpcController
 	return {
 		raw = message,
 		lower = lower,
@@ -65,8 +68,7 @@ function Brain:Analyze(message: string, session: any): Analysis
 end
 
 local function technicalFocus(analysis: Analysis): string
-	-- choose a real technical word first, then fall back to the recent topic
-	-- this makes "explain that" still useful after the player mentioned pathfinding
+	-- use a tech word from this message first then fall back to the topic in memory
 	for _, word in analysis.words do
 		if TextUtil.isTechnicalWord(word) then
 			return word
@@ -76,8 +78,7 @@ local function technicalFocus(analysis: Analysis): string
 end
 
 function Brain:_TechnicalReply(analysis: Analysis): string
-	-- the technical reply is templated by concept, not by full sentence
-	-- that keeps it local and cheap while still explaining the actual code split
+	-- these replies explain the topic without needing any http or outside ai
 	local subject = technicalFocus(analysis)
 	local first = TextUtil.pick({
 		"{subject} is easiest to understand by separating input, state, and output.",
@@ -95,15 +96,13 @@ function Brain:_TechnicalReply(analysis: Analysis): string
 end
 
 function Brain:_CommandReply(analysis: Analysis): string?
-	-- command replies come from the registry so the command meaning and wording
-	-- are tied to one source
+	-- command replies come from the same entry that Brain used to match the command
 	return CommandRegistry.BuildCommandReply(analysis.intent, analysis.direction, analysis.lower)
 end
 
 function Brain:Reply(player: Player, analysis: Analysis): string
-	-- reply priority matters
-	-- actions answer first, then greetings, then technical explanations, then mood
-	-- normal chat stays lightweight so the dummy does not overtalk every message
+	--[[ command replies come first because they confirm an action
+	after that i check greetings tech questions tone questions and then normal chat ]]
 	local movementReply = self:_CommandReply(analysis)
 	if movementReply then
 		return movementReply
@@ -111,15 +110,15 @@ function Brain:Reply(player: Player, analysis: Analysis): string
 
 	local playerName = player.DisplayName ~= "" and player.DisplayName or player.Name
 	if TextUtil.hasAny(analysis.words, { yo = true, hi = true, hey = true, sup = true, wsg = true }) then
-		-- greetings should feel quick and normal, not like a technical manual
+		-- greetings do not need the longer reply system
 		return TextUtil.pick({ "yo wsg " .. playerName, "sup, im listening.", "yoo, what we doing?", "what's good." }, analysis.lower)
 	end
 	if analysis.isTechnical then
-		-- technical messages get longer answers because the player is asking to learn
+		-- tech questions use _TechnicalReply because they need more detail
 		return self:_TechnicalReply(analysis)
 	end
 	if analysis.sentiment >= 2 then
-		-- tone only changes wording, never movement authority
+		-- tone only changes what the dummy says and can never start an action
 		return TextUtil.pick({ "yeah that is clean.", "real, that is a good idea.", "that sounds solid.", "i see the vision." }, analysis.lower)
 	end
 	if analysis.sentiment <= -2 then
